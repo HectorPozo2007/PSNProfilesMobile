@@ -1,161 +1,301 @@
 package com.example.psnprofilesmobile;
 
 import android.os.Bundle;
-
-import androidx.appcompat.app.AppCompatActivity;
-
-// Android imports
+import android.os.Handler;
+import android.os.Looper;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceError;
+import android.widget.ProgressBar;
+import android.view.View;
+import android.view.ViewGroup;
 
-// import java.io.BufferedReader; Deprecated imports will no longer be used with the new website parser
+import androidx.activity.OnBackPressedCallback;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
+
+import java.io.BufferedReader;
 import java.io.InputStream;
-// import java.io.InputStreamReader; Deprecated imports will no longer be used with the new website parser
+import java.io.InputStreamReader;
+import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-// JSoup imports
+import org.json.JSONArray;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
-import org.jsoup.select.Elements;
-import java.io.IOException;
 
 public class MainActivity extends AppCompatActivity {
 
-    // Declaration of a WebView to interact with the webview element
     private WebView myWebView;
+    private SwipeRefreshLayout swipeRefreshLayout;
+    private ProgressBar progressBar;
     private String userAgent;
+
+    // Cache the CSS string in memory to avoid repeated disk reads
+    private String cachedCss = null;
+
+    // Executor service to offload I/O operations from the main thread
+    private final ExecutorService executorService = Executors.newSingleThreadExecutor();
+    
+    // Class-level Handler to prevent anonymous inner class memory leaks
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private Runnable domPollingRunnable;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        // We set the content view to the layout we defined before in activity_main.xml
         setContentView(R.layout.activity_main);
 
-        // Find the WebView element by its ID
+        // Find views by ID
         myWebView = findViewById(R.id.webView);
+        swipeRefreshLayout = findViewById(R.id.swipeRefreshLayout);
+        progressBar = findViewById(R.id.progressBar);
 
-        // We get the WebSettings object to configure the WebView settings
-        WebSettings webSettings = myWebView.getSettings();
-
-        // Enable JavaScript
-        webSettings.setJavaScriptEnabled(true);
-        // We activate the DOM storage
-        webSettings.setDomStorageEnabled(true);
-        // If not, uses network
-        webSettings.setCacheMode(webSettings.LOAD_DEFAULT);
-        // Hardware Acceleration to improve performance
-        myWebView.setLayerType(android.view.View.LAYER_TYPE_HARDWARE, null);
-        // Images dont load first to improve performance !!CHECK LATER onPageFinished()
-        // METHOD
-        webSettings.setLoadsImagesAutomatically(false);
-        // Save User-Agent for Jsoup interceptor
-        userAgent = webSettings.getUserAgentString();
-        // We activate cookies
-        android.webkit.CookieManager cookieManager = android.webkit.CookieManager.getInstance();
-        cookieManager.setAcceptCookie(true);
-
-        // We accept third-party cookies
-        cookieManager.setAcceptThirdPartyCookies(myWebView, true);
-
-        // Set WebViewClient to ensure links open within the WebView, not the browser
-        myWebView.setWebViewClient(new WebViewClient() {
-            @Override
-            public void onPageFinished(WebView view, String url) {
-                super.onPageFinished(view, url);
-                // We load the images after the page has finished loading
-                view.getSettings().setLoadsImagesAutomatically(true);
-            }
-
-            // Completely revamped interceptor method to inject CSS before it loads,
-            // and to fetch the cookies from the WebView so the connection stays logged in!
-            // old CSS injection is greatly deprecated after using jsoup (API that fetches
-            // data)
-            @Override
-            public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view,
-                    android.webkit.WebResourceRequest request) {
-                String url = request.getUrl().toString();
-
-                // We only want to intercept the main HTML documents (GET requests) to inject
-                // our CSS before it loads
-                if (request.isForMainFrame() && request.getMethod().equalsIgnoreCase("GET")
-                        && url.contains("psnprofiles.com")) {
-                    try {
-                        // Fetch the cookies from the WebView so the connection stays logged in!
-                        String cookies = android.webkit.CookieManager.getInstance().getCookie(url);
-
-                        // Use JSoup to fetch the HTML content
-                        org.jsoup.Connection connection = Jsoup.connect(url)
-                                .userAgent(userAgent);
-                        if (cookies != null) {
-                            connection.header("Cookie", cookies);
-                        }
-                        Document document = connection.get();
-
-                        // Add the Viewport Meta tag
-                        document.head().append(
-                                "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no\">");
-
-                        // Add our custom CSS directly to the HEAD
-                        String css = getCSSFromAssets();
-                        document.head().append("<style>" + css + "</style>");
-
-                        // Return the modified HTML back to the WebView as a WebResourceResponse
-                        InputStream modifiedHtml = new java.io.ByteArrayInputStream(
-                                document.outerHtml().getBytes("UTF-8"));
-                        return new android.webkit.WebResourceResponse("text/html", "UTF-8", modifiedHtml);
-
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
-                }
-
-                // For all other requests (images, standard css, scripts), let them load
-                // normally
-                return super.shouldInterceptRequest(view, request);
-            }
+        // Load the CSS in a background thread to prevent StrictMode violations
+        executorService.execute(() -> {
+            cachedCss = getCSSFromAssets();
         });
 
+        setupWebView();
+        setupSwipeRefresh();
+        setupBackNavigation();
+
+        // Load the initial URL
         myWebView.loadUrl("https://psnprofiles.com/guides/popular");
     }
 
-    // New function that reassures the user not to quit the app if he tries to go
-    // back or presses the back button
+    private void setupWebView() {
+        WebSettings webSettings = myWebView.getSettings();
+
+        // Basic settings
+        webSettings.setJavaScriptEnabled(true);
+        webSettings.setDomStorageEnabled(true);
+        webSettings.setCacheMode(WebSettings.LOAD_DEFAULT);
+        
+        // Hardware Acceleration
+        myWebView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        
+        // Delay image loading to improve performance
+        webSettings.setLoadsImagesAutomatically(false);
+        
+        // Setup userAgent and cookies
+        userAgent = webSettings.getUserAgentString();
+        android.webkit.CookieManager cookieManager = android.webkit.CookieManager.getInstance();
+        cookieManager.setAcceptCookie(true);
+        cookieManager.setAcceptThirdPartyCookies(myWebView, true);
+
+        // WebChromeClient to track loading progress for the ProgressBar
+        myWebView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onProgressChanged(WebView view, int newProgress) {
+                super.onProgressChanged(view, newProgress);
+                if (newProgress < 100) {
+                    progressBar.setVisibility(View.VISIBLE);
+                    progressBar.setProgress(newProgress);
+                } else {
+                    progressBar.setVisibility(View.GONE);
+                }
+            }
+        });
+
+        // Set WebViewClient
+        myWebView.setWebViewClient(new WebViewClient() {
+            
+            // Gracefully handle network offline or server crash scenarios
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                super.onReceivedError(view, request, error);
+                // Ensure we only hide loaders for the main frame to avoid hiding when a small tracking script fails
+                if (request.isForMainFrame()) {
+                    progressBar.setVisibility(View.GONE);
+                    if (swipeRefreshLayout.isRefreshing()) {
+                        swipeRefreshLayout.setRefreshing(false);
+                    }
+                }
+            }
+            
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                view.getSettings().setLoadsImagesAutomatically(true);
+                // Stop the swipe refresh layout loading wheel
+                if (swipeRefreshLayout.isRefreshing()) {
+                    swipeRefreshLayout.setRefreshing(false);
+                }
+
+                // 1. First, we inject our CSS and Viewport natively via Javascript
+                if (cachedCss != null && !cachedCss.isEmpty()) {
+                    // We must escape our CSS to inject it cleanly using JS
+                    String escapedCss = cachedCss
+                            .replace("\\", "\\\\")
+                            .replace("'", "\\'")
+                            .replace("\"", "\\\"")
+                            .replace("\n", "\\n")
+                            .replace("\r", "");
+
+                    String injectCSS = "javascript:(function() {" +
+                            "var parent = document.getElementsByTagName('head').item(0);" +
+                            "var style = document.createElement('style');" +
+                            "style.type = 'text/css';" +
+                            "style.innerHTML = '" + escapedCss + "';" +
+                            "if (parent != null) parent.appendChild(style);" +
+                            "var meta = document.createElement('meta');" +
+                            "meta.name = 'viewport';" +
+                            "meta.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no';"
+                            +
+                            "if (parent != null) parent.appendChild(meta);" +
+                            "})()";
+                    view.evaluateJavascript(injectCSS, null);
+                }
+
+                // 2. Active DOM Polling loop to bypass Cloudflare reliably without static 2000ms waits
+                // Cancel any previous loop that might be running
+                if (domPollingRunnable != null) {
+                    mainHandler.removeCallbacks(domPollingRunnable);
+                }
+                
+                domPollingRunnable = new Runnable() {
+                    int attempts = 0;
+                    final int MAX_ATTEMPTS = 20; // 10 seconds total given 500ms delay
+
+                    @Override
+                    public void run() {
+                        if (myWebView == null) return;
+                        
+                        attempts++;
+                        
+                        // Check if a primary container or guide element has loaded, confirming Cloudflare has passed
+                        myWebView.evaluateJavascript(
+                            "(function() { return document.querySelector('#content') != null || document.querySelector('.guide') != null || document.querySelector('.box') != null; })();",
+                            new ValueCallback<String>() {
+                                @Override
+                                public void onReceiveValue(String isDOMReady) {
+                                    // evaluateJavascript returns the boolean as a string "true" or "false"
+                                    if ("true".equals(isDOMReady)) {
+                                        // DOM has fully rendered the target website elements! Extract the HTML.
+                                        myWebView.evaluateJavascript(
+                                                "(function() { return document.documentElement.outerHTML; })();",
+                                                new ValueCallback<String>() {
+                                                    @Override
+                                                    public void onReceiveValue(String htmlString) {
+                                                        if (htmlString != null && !htmlString.equals("null")) {
+                                                            try {
+                                                                JSONArray jsonArray = new JSONArray("[" + htmlString + "]");
+                                                                String decodedHtml = jsonArray.getString(0);
+                                                                
+                                                                // Process with JSoup natively on a background thread!
+                                                                executorService.execute(() -> {
+                                                                    Document document = Jsoup.parse(decodedHtml);
+                                                                    // TODO: Parse the data out of the connected document here
+                                                                });
+                                                            } catch (Exception e) {
+                                                                e.printStackTrace();
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                        );
+                                    } else {
+                                        // Target not found securely yet (e.g. still looping on Cloudflare 'Checking Browser')
+                                        // Retry in 500ms, until max attempts hit
+                                        if (attempts < MAX_ATTEMPTS) {
+                                            mainHandler.postDelayed(domPollingRunnable, 500);
+                                        }
+                                    }
+                                }
+                            }
+                        );
+                    }
+                };
+                
+                // Start the polling cycle 
+                mainHandler.post(domPollingRunnable);
+            }
+        });
+    }
+
+    private void setupSwipeRefresh() {
+        swipeRefreshLayout.setOnRefreshListener(() -> {
+            if (myWebView != null) {
+                myWebView.reload();
+            }
+        });
+    }
+
+    private void setupBackNavigation() {
+        // Modern replacement for deprecated onBackPressed()
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                if (myWebView != null && myWebView.canGoBack()) {
+                    // Navigate back in WebView history
+                    myWebView.goBack();
+                } else {
+                    // Otherwise exit the app normally
+                    setEnabled(false); // disable custom callback to let default behavior run
+                    getOnBackPressedDispatcher().onBackPressed();
+                }
+            }
+        });
+    }
+
     @Override
-    public void onBackPressed() {
-        if (myWebView != null && myWebView.canGoBack()) {
-            // If the WebView can go back, it will go back
-            myWebView.goBack();
-        } else {
-            // Otherwise, it will exit the app
-            super.onBackPressed();
+    protected void onPause() {
+        super.onPause();
+        if (myWebView != null) {
+            myWebView.onPause();
+        }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (myWebView != null) {
+            myWebView.onResume();
         }
     }
 
     @Override
     protected void onDestroy() {
+        // Stop background handlers to prevent memory leaks if activity is closed
+        if (mainHandler != null) {
+            mainHandler.removeCallbacksAndMessages(null);
+        }
+        
         if (myWebView != null) {
+            // Safely detach WebView before destroying to prevent memory leaks
+            ViewGroup parent = (ViewGroup) myWebView.getParent();
+            if (parent != null) {
+                parent.removeView(myWebView);
+            }
+            myWebView.removeAllViews();
             myWebView.destroy();
+        }
+        
+        // Shutdown executor cleanly
+        if (executorService != null && !executorService.isShutdown()) {
+            executorService.shutdown();
         }
         super.onDestroy();
     }
 
-    // We fetch the CSS from the assets folder as a String so JSoup can inject it
-    // into the HTML document before serving it
+    // Safely parse stream instead of using un-reliable inputStream.available()
     private String getCSSFromAssets() {
-        try (InputStream inputStream = getAssets().open("style_psn.css")) {
-
-            // We allocate a byte array of the exact size of the file and read it all at
-            // once
-            byte[] buffer = new byte[inputStream.available()];
-            inputStream.read(buffer);
-
-            // We extract the content from the buffer as an immutable String
-            return new String(buffer);
-
-        } catch (Exception e) {
+        StringBuilder cssBuilder = new StringBuilder();
+        try (InputStream inputStream = getAssets().open("style_psn.css");
+             BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, "UTF-8"))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                cssBuilder.append(line).append("\n");
+            }
+        } catch (IOException e) {
             e.printStackTrace();
-            return "";
         }
+        return cssBuilder.toString();
     }
 }
