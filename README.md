@@ -10,10 +10,8 @@ It utilizes a `WebView` to load the website and injects custom CSS to hide adver
 ## Features
 * **Seamless Web Viewing:** Wraps the PSNProfiles page in a native Android application.
 
-* **Ad Hiding:** Injects CSS to automatically hide known advertisement elements. (On the go)
-
 * **Mobile Optimization:** Restructures the layout from rows to columns and forces elements 
-to occupy 100% of the screen width for a native mobile feel. 
+to occupy 100% of the screen width for a native mobile feel. (Depends on the guide, tables are still bugged/Not properly managed)
 
 * **Cookie Management:** Automatically handles first-party and third-party cookies for seamless session management.
 
@@ -30,8 +28,8 @@ The `MainActivity.java` is the entry point of the application. It handles the se
 
 ## Build Instructions
 
-    1. Clone the repository.
-
+    1. git clone https://github.com/HectorPozo2007/PSNProfilesMobile.git
+    
     2. Open the project in Android Studio.
 
     3. Sync the project with Gradle files.
